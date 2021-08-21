@@ -1,23 +1,154 @@
 import torch
 import torch.nn as nn
+import math
+import numpy as np
+
 
 OPS = {
-  'none' : lambda C, stride, affine: Zero(stride),
-  'avg_pool_3x3' : lambda C, stride, affine: nn.AvgPool2d(3, stride=stride, padding=1, count_include_pad=False),
-  'max_pool_3x3' : lambda C, stride, affine: nn.MaxPool2d(3, stride=stride, padding=1),
-  'skip_connect' : lambda C, stride, affine: Identity() if stride == 1 else FactorizedReduce(C, C, affine=affine),
-  'sep_conv_3x3' : lambda C, stride, affine: SepConv(C, C, 3, stride, 1, affine=affine),
-  'sep_conv_5x5' : lambda C, stride, affine: SepConv(C, C, 5, stride, 2, affine=affine),
-  'sep_conv_7x7' : lambda C, stride, affine: SepConv(C, C, 7, stride, 3, affine=affine),
-  'dil_conv_3x3' : lambda C, stride, affine: DilConv(C, C, 3, stride, 2, 2, affine=affine),
-  'dil_conv_5x5' : lambda C, stride, affine: DilConv(C, C, 5, stride, 4, 2, affine=affine),
-  'conv_7x1_1x7' : lambda C, stride, affine: nn.Sequential(
-    nn.ReLU(inplace=False),
-    nn.Conv2d(C, C, (1,7), stride=(1, stride), padding=(0, 3), bias=False),
-    nn.Conv2d(C, C, (7,1), stride=(stride, 1), padding=(3, 0), bias=False),
-    nn.BatchNorm2d(C, affine=affine)
-    ),
+  # candidate opoeration Dictionary
+  'transformer_focal'     : lambda dim: Transformer_focal(dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.),
+  'transformer_performer' : lambda dim: Transformer_performer(dim, num_heads=1, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., kernel_ratio=0.5),
+  'transformer_cswin'     : lambda dim: Transformer_cswin(dim, num_heads=1, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., kernel_ratio=0.5),
+  'transformer'        : lambda dim: Transformer(dim, num_heads=1, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., kernel_ratio=0.5),
+  'conv_mobile'           : lambda dim: Conv_mobile(dim, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                             drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, class_token=False, group=64, tokens_type='transformer'),
+  'conv_bottleneck'       : lambda dim: Conv_bottleneck(dim, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                             drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, class_token=False, group=64, tokens_type='transformer'),
+  'conv_xx'               : lambda dim: Conv_xx(dim, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                             drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, class_token=False, group=64, tokens_type='transformer'),                             
 }
+
+# all the operations share the same para
+
+#########################################################
+# Transformer Operations
+#########################################################
+
+class Transformer_focal(nn.Module):
+    def __init__(self):
+        super(Transformer_focal).__init__()
+
+    
+    def forward(self,x):
+
+        return x
+
+
+class Transformer_performer(nn.Module):
+    def __init__(self, dim, num_heads=1, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., kernel_ratio=0.5):
+        super(Transformer_performer,self).__init__()
+        self.emb = dim * num_heads # we use 1, so it is no need here
+        self.kqv = nn.Linear(dim, 3 * self.emb)
+        self.dp = nn.Dropout(proj_drop)
+        self.proj = nn.Linear(self.emb, self.emb)
+        self.head_cnt = num_heads
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.epsilon = 1e-8  # for stable in division
+        self.drop_path = nn.Identity()
+
+        self.m = int(self.emb * kernel_ratio)
+        self.w = torch.randn(self.m, self.emb)
+        self.w = nn.Parameter(nn.init.orthogonal_(self.w) * math.sqrt(self.m), requires_grad=False)
+
+    def prm_exp(self, x):
+        # part of the function is borrow from https://github.com/lucidrains/performer-pytorch 
+        # and Simo Ryu (https://github.com/cloneofsimo)
+        # ==== positive random features for gaussian kernels ====
+        # x = (B, T, hs)
+        # w = (m, hs)
+        # return : x : B, T, m
+        # SM(x, y) = E_w[exp(w^T x - |x|/2) exp(w^T y - |y|/2)]
+        # therefore return exp(w^Tx - |x|/2)/sqrt(m)
+        xd = ((x * x).sum(dim=-1, keepdim=True)).repeat(1, 1, self.m) / 2
+        wtx = torch.einsum('bti,mi->btm', x.float(), self.w)
+
+        return torch.exp(wtx - xd) / math.sqrt(self.m)
+
+    def attn(self, x):
+        k, q, v = torch.split(self.kqv(x), self.emb, dim=-1)
+        kp, qp = self.prm_exp(k), self.prm_exp(q)  # (B, T, m), (B, T, m)
+        D = torch.einsum('bti,bi->bt', qp, kp.sum(dim=1)).unsqueeze(dim=2)  # (B, T, m) * (B, m) -> (B, T, 1)
+        kptv = torch.einsum('bin,bim->bnm', v.float(), kp)  # (B, emb, m)
+        y = torch.einsum('bti,bni->btn', qp, kptv) / (D.repeat(1, 1, self.emb) + self.epsilon)  # (B, T, emb)/Diag
+        # skip connection
+        y = self.dp(self.proj(y))  # same as token_transformer in T2T layer, use v as skip connection
+        return y
+
+    def forward(self, x):
+        x = self.attn(x)
+        return x
+
+class Transformer_cswin(nn.Module):
+    def __init__(self):
+        super(Transformer_cswin).__init__()
+
+    
+    def forward(self,x):
+
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super(Transformer,self).__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+#########################################################
+# CNN Operations
+#########################################################
+
+class Conv_mobile(nn.Module):
+    def __init__(self):
+        super(Conv_mobile).__init__()
+
+    
+    def forward(self,x):
+
+        return x
+
+
+
+class Conv_bottleneck(nn.Module):
+    def __init__(self):
+        super(Conv_bottleneck).__init__()
+
+    
+    def forward(self,x):
+
+        return x
+
+
+
+class Conv_xx(nn.Module):
+    def __init__(self):
+        super(Conv_xx).__init__()
+
+    
+    def forward(self,x):
+
+        return x
 
 class ReLUConvBN(nn.Module):
 
